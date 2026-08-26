@@ -62,6 +62,7 @@ function addEndpoint() {
     modelName: '',
     priority: 5,
     enabled: true,
+    thinkingMode: null,
   }]
   update({ endpoints })
 }
@@ -171,7 +172,8 @@ async function handleTestEndpoint(ep: ApiEndpointConfig) {
     )
     const r = results[0]
     if (r && r.success) {
-      message.success(`${ep.name || '提供商'} 测试成功: ${r.translations?.join(' | ')} (${Math.round(r.responseTimeMs)}ms)`)
+      const thinkingText = r.thinkingActive != null ? `，${thinkingActiveLabel(r.thinkingActive)}` : ''
+      message.success(`${ep.name || '提供商'} 测试成功: ${r.translations?.join(' | ')} (${Math.round(r.responseTimeMs)}ms)${thinkingText}`)
     } else {
       message.error(`${ep.name || '提供商'} 测试失败: ${r?.error || '未知错误'}`)
     }
@@ -198,14 +200,14 @@ async function handleTestAll() {
     const totalCount = results.length
 
     if (successCount === totalCount) {
-      const details = results.map(r => `${r.endpointName}: ${r.translations?.join(' | ')} (${Math.round(r.responseTimeMs)}ms)`).join('\n')
+      const details = results.map(r => `${r.endpointName}: ${r.translations?.join(' | ')} (${Math.round(r.responseTimeMs)}ms)${r.thinkingActive != null ? `，${thinkingActiveLabel(r.thinkingActive)}` : ''}`).join('\n')
       message.success(`全部 ${totalCount} 个提供商测试成功\n${details}`, { duration: 6000 })
     } else {
       const failed = results.filter(r => !r.success)
       const succeeded = results.filter(r => r.success)
       let msg = `${successCount}/${totalCount} 个提供商测试成功`
       if (succeeded.length > 0)
-        msg += `\n成功: ${succeeded.map(r => r.endpointName).join(', ')}`
+        msg += `\n成功: ${succeeded.map(r => `${r.endpointName}${r.thinkingActive != null ? `(${thinkingActiveLabel(r.thinkingActive)})` : ''}`).join(', ')}`
       msg += `\n失败: ${failed.map(r => `${r.endpointName}(${r.error})`).join(', ')}`
       message.warning(msg, { duration: 8000 })
     }
@@ -222,6 +224,39 @@ const priorityMarks = computed(() => {
   for (let i = 1; i <= 10; i++) marks[i] = String(i)
   return marks
 })
+
+type ThinkingModeOption = 'default' | 'enabled' | 'disabled'
+
+const thinkingModeOptions: { label: string; value: ThinkingModeOption }[] = [
+  { label: '跟随默认', value: 'default' },
+  { label: '开启思考', value: 'enabled' },
+  { label: '关闭思考', value: 'disabled' },
+]
+
+function thinkingModeValue(mode: boolean | null | undefined): ThinkingModeOption {
+  return mode == null ? 'default' : mode ? 'enabled' : 'disabled'
+}
+
+function thinkingModeLabel(mode: boolean | null | undefined): string {
+  return mode == null ? '跟随默认' : mode ? '思考模式' : '非思考模式'
+}
+
+function thinkingActiveLabel(active: boolean | null | undefined): string {
+  return active == null ? '思考状态未知' : active ? '实际思考中' : '实际非思考'
+}
+
+function thinkingModeTagColor(enabled: boolean, mode: boolean | null | undefined): { color: string; textColor: string; borderColor: string } {
+  if (!enabled) {
+    return { color: 'rgba(128, 128, 128, 0.14)', textColor: '#9e9e9e', borderColor: 'rgba(128, 128, 128, 0.35)' }
+  }
+  if (mode === true) {
+    return { color: 'rgba(233, 30, 99, 0.14)', textColor: '#ec407a', borderColor: 'rgba(233, 30, 99, 0.35)' }
+  }
+  if (mode === false) {
+    return { color: 'rgba(156, 39, 176, 0.14)', textColor: '#ab47bc', borderColor: 'rgba(156, 39, 176, 0.35)' }
+  }
+  return { color: 'rgba(255, 152, 0, 0.14)', textColor: '#fb8c00', borderColor: 'rgba(255, 152, 0, 0.35)' }
+}
 </script>
 
 <template>
@@ -352,6 +387,9 @@ const priorityMarks = computed(() => {
               <NTag v-if="ep.enabled && ep.apiKey" size="small" type="info">
                 优先级 {{ ep.priority }}
               </NTag>
+              <NTag v-if="ep.provider === 'DeepSeek'" size="small" :color="thinkingModeTagColor(ep.enabled, ep.thinkingMode)">
+                {{ thinkingModeLabel(ep.thinkingMode) }}
+              </NTag>
             </div>
           </template>
           <template #header-extra>
@@ -441,6 +479,16 @@ const priorityMarks = computed(() => {
                 </NButton>
               </div>
               <span class="form-hint">留空使用默认模型{{ supportsModelList[ep.provider] ? '，点击搜索图标获取模型列表' : '' }}</span>
+            </div>
+
+            <div v-if="ep.provider === 'DeepSeek'" class="form-row">
+              <label class="form-label">思考模式</label>
+              <NSelect
+                :value="thinkingModeValue(ep.thinkingMode)"
+                @update:value="(v: ThinkingModeOption) => updateEndpoint(index, { thinkingMode: v === 'default' ? null : v === 'enabled' })"
+                :options="thinkingModeOptions"
+              />
+              <span class="form-hint">仅 DeepSeek 系列模型生效；开启思考可提升翻译质量，但会增加延迟与 token 消耗</span>
             </div>
 
             <div class="form-row">

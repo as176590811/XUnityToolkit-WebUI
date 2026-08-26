@@ -94,6 +94,7 @@ const settings = ref<AppSettings>({
     localContextSize: 3,
     localMinP: 0.05,
     localRepeatPenalty: 1.0,
+    localConcurrency: 4,
     endpoints: [],
     glossaryExtractionEnabled: false,
     enablePreTranslationCache: true,

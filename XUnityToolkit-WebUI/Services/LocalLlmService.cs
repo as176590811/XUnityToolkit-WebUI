@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Management;
@@ -424,7 +424,19 @@ public sealed class LocalLlmService(
                 ? currentSettings.KvCacheType : "q8_0";
             var kvArgs = kvType != "f16" ? $"--cache-type-k {kvType} --cache-type-v {kvType}" : "";
 
-            var args = $"-m \"{safeModelPath}\" --host 127.0.0.1 --port {_internalPort} -ngl {gpuLayers} -c {contextLength} {perfArgs} {kvArgs} --no-webui --reasoning-budget 0";
+            // Parallel slots (-np): local translation concurrency is bounded at the WebUI
+            // semaphore, but llama-server must pre-allocate slots at startup. Changing the
+            // local concurrency slider requires restarting the model to take effect.
+            var concurrency = Math.Clamp((await settingsService.GetAsync(ct)).AiTranslation.LocalConcurrency, 1, 100);
+
+            // llama.cpp splits the total -c context evenly across -np slots. Scale the total
+            // context by concurrency so each slot still gets the user-requested contextLength;
+            // otherwise a higher -np silently shrinks per-slot context and causes 400
+            // "exceeds the available context size" errors. Note total context grows linearly
+            // with concurrency, so an overly large slider can exhaust VRAM.
+            var totalContext = contextLength * concurrency;
+
+            var args = $"-m \"{safeModelPath}\" --host 127.0.0.1 --port {_internalPort} -ngl {gpuLayers} -c {totalContext} -np {concurrency} {perfArgs} {kvArgs} --no-webui --reasoning-budget 0";
 
             logger.LogInformation("llama 模型启动路径策略: {Strategy}, launch path: {LaunchPath}, resolved file: {ResolvedFilePath}",
                 launchModelPath.Strategy, launchModelPath.LaunchPath, launchModelPath.ResolvedFilePath);

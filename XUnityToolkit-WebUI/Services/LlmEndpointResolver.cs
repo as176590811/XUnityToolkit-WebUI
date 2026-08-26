@@ -36,6 +36,7 @@ internal static class LlmEndpointResolver
         ApiKey = endpoint.ApiKey,
         ModelName = endpoint.ModelName,
         Priority = endpoint.Priority,
-        Enabled = endpoint.Enabled
+        Enabled = endpoint.Enabled,
+        ThinkingMode = endpoint.ThinkingMode
     };
 }

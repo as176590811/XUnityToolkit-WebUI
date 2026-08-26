@@ -319,7 +319,7 @@ public sealed partial class PreTranslationService(
         var settings = await settingsService.GetAsync(ct);
         var aiSettings = settings.AiTranslation;
         var isLocalMode = string.Equals(aiSettings.ActiveMode, "local", StringComparison.OrdinalIgnoreCase);
-        var maxConc = isLocalMode ? 1 : Math.Clamp(aiSettings.MaxConcurrency, 1, 100);
+        var maxConc = Math.Clamp(isLocalMode ? aiSettings.LocalConcurrency : aiSettings.MaxConcurrency, 1, 100);
         var batchSize = isLocalMode ? 5 : 10;
 
         var templateVars = dynamicPatternService.DetectTemplateVariables(textList);

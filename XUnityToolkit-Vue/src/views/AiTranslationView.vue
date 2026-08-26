@@ -68,6 +68,7 @@ const DEFAULT_AI_TRANSLATION: AiTranslationSettings = {
   localContextSize: 3,
   localMinP: 0.05,
   localRepeatPenalty: 1.0,
+  localConcurrency: 4,
   endpoints: [],
   glossaryExtractionEnabled: false,
   enablePreTranslationCache: true,

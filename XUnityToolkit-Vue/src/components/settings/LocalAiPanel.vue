@@ -471,6 +471,18 @@ onBeforeUnmount(() => {
           <span class="form-hint">附带的近期翻译对数量，0 为关闭（本地模式最多 10）</span>
         </div>
         <div class="form-row">
+          <label class="form-label">最大并发数（{{ modelValue.localConcurrency ?? 4 }}）</label>
+          <NSlider
+            :value="modelValue.localConcurrency ?? 4"
+            @update:value="(v: number) => updateAiSettings({ localConcurrency: v })"
+            :min="1"
+            :max="100"
+            :step="1"
+            :tooltip="true"
+          />
+          <span class="form-hint">同时处理多少个翻译请求。总上下文 = 并发数 × 上下文长度，并发过高会显著增加显存占用，建议不超过 4；修改后需重启本地模型才生效</span>
+        </div>
+        <div class="form-row">
           <label class="form-label">min_p（{{ modelValue.localMinP?.toFixed(2) ?? '0.05' }}）</label>
           <NSlider
             :value="modelValue.localMinP ?? 0.05"

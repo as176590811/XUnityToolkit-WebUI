@@ -180,12 +180,15 @@ export interface ApiEndpointConfig {
   modelName: string
   priority: number
   enabled: boolean
+  /** 思考模式开关（仅 DeepSeek 系列模型生效）：null=跟随模型默认，true=开启，false=关闭 */
+  thinkingMode?: boolean | null
 }
 
 export interface AiTranslationSettings {
   enabled: boolean
   activeMode: 'cloud' | 'local'
   maxConcurrency: number
+  localConcurrency: number
   port: number
   systemPrompt: string
   temperature: number
@@ -381,6 +384,8 @@ export interface EndpointTestResult {
   translations?: string[]
   error?: string
   responseTimeMs: number
+  /** 实际思考模式状态（仅 DeepSeek 有效）：true=思考中，false=非思考，null=不适用/未知 */
+  thinkingActive?: boolean | null
 }
 
 // ── Unified Term Management ──

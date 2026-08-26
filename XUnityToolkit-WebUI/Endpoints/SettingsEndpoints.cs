@@ -27,6 +27,7 @@ public static class SettingsEndpoints
         {
             // Server-side validation: clamp values to valid ranges
             settings.AiTranslation.MaxConcurrency = Math.Clamp(settings.AiTranslation.MaxConcurrency, 1, 100);
+            settings.AiTranslation.LocalConcurrency = Math.Clamp(settings.AiTranslation.LocalConcurrency, 1, 100);
             settings.AiTranslation.Port = Math.Clamp(settings.AiTranslation.Port, 1, 65535);
             settings.AiTranslation.ContextSize = Math.Clamp(settings.AiTranslation.ContextSize, 0, 100);
             settings.AiTranslation.LocalContextSize = Math.Clamp(settings.AiTranslation.LocalContextSize, 0, 10);

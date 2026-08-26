@@ -375,8 +375,9 @@ public sealed class LlmTranslationService(
                     memoryContext = null;
             }
 
-            // Ensure semaphore matches configured concurrency — forced to 1 in local mode
-            var maxConc = isLocalMode ? 1 : Math.Clamp(ai.MaxConcurrency, 1, 100);
+            // Ensure semaphore matches configured concurrency (local uses its own slot)
+            // Local mode concurrency requires llama-server pre-allocated -np slots at startup.
+            var maxConc = Math.Clamp(isLocalMode ? ai.LocalConcurrency : ai.MaxConcurrency, 1, 100);
             EnsureSemaphore(maxConc);
             var semaphore = Volatile.Read(ref _semaphore)!; // Acquire-read for ARM safety
 
@@ -774,33 +775,20 @@ public sealed class LlmTranslationService(
 
                 if (llmTexts.Count > 0)
                 {
-                    if (isLocalMode && llmTexts.Count > 1)
-                    {
-                        // Optimized local path: single semaphore acquisition, cached system prompt, throttled broadcasts
-                        var (r, t, m, e) = await TranslateLocalSequentialAsync(
-                            llmTexts, from, to, ai, enabledEndpoints, promptGlossary,
-                            gameDescription, memoryContext, dntHint, semaphore, ct,
-                            fallbackTexts: llmIndexMap.Select(index => phase2SourceTexts[index]).ToList());
-                        batchResult = r;
-                        tokens += t;
-                        ms += m;
-                        endpointName = e;
-                    }
-                    else
-                    {
-                        IList<TranslationCandidate> p2Result;
-                        long p2Tokens;
-                        double p2Ms;
-                        string p2Endpoint;
-                        (p2Result, p2Tokens, p2Ms, p2Endpoint) = await TranslateBatchAsync(
-                            llmTexts, from, to, ai, enabledEndpoints, promptGlossary,
-                            gameDescription, memoryContext, dntHint, semaphore, ct,
-                            fallbackTexts: llmIndexMap.Select(index => phase2SourceTexts[index]).ToList());
-                        batchResult = p2Result;
-                        tokens += p2Tokens;
-                        ms += p2Ms;
-                        endpointName = p2Endpoint;
-                    }
+                    // Cloud and local both use the same concurrent batch path; local-only
+                    // concurrency is bounded by the semaphore sized from ai.LocalConcurrency.
+                    IList<TranslationCandidate> p2Result;
+                    long p2Tokens;
+                    double p2Ms;
+                    string p2Endpoint;
+                    (p2Result, p2Tokens, p2Ms, p2Endpoint) = await TranslateBatchAsync(
+                        llmTexts, from, to, ai, enabledEndpoints, promptGlossary,
+                        gameDescription, memoryContext, dntHint, semaphore, ct,
+                        fallbackTexts: llmIndexMap.Select(index => phase2SourceTexts[index]).ToList());
+                    batchResult = p2Result;
+                    tokens += p2Tokens;
+                    ms += p2Ms;
+                    endpointName = p2Endpoint;
                 }
                 else
                 {
@@ -1219,7 +1207,7 @@ public sealed class LlmTranslationService(
                     chosenEndpoint = SelectEndpoint(endpoints);
                     var sw = Stopwatch.StartNew();
 
-                    var (result, tokens) = await CallProviderAsync(
+                    var (result, tokens, _) = await CallProviderAsync(
                         chosenEndpoint, ai, texts, from, to, glossary, gameDescription, memoryContext, dntHint, ct,
                         fallbackTexts ?? texts,
                         overrideSystemPrompt);
@@ -1297,134 +1285,6 @@ public sealed class LlmTranslationService(
     private static bool IsTransientError(Exception ex) =>
         ex is TaskCanceledException or HttpRequestException or TimeoutException;
 
-    /// <summary>
-    /// Optimized local-mode path: acquires semaphore once, caches system prompt,
-    /// and translates texts one by one with throttled broadcasts.
-    /// </summary>
-    private async Task<(IList<TranslationCandidate> translations, long tokens, double ms, string endpointName)>
-        TranslateLocalSequentialAsync(
-            IList<string> texts, string from, string to,
-            AiTranslationSettings ai, List<ApiEndpointConfig> endpoints,
-            List<TermEntry>? glossary, string? gameDescription,
-            IList<TranslationMemoryEntry>? memoryContext,
-            string? dntHint, SemaphoreSlim semaphore, CancellationToken ct,
-            IList<string>? fallbackTexts = null)
-    {
-        Interlocked.Increment(ref _queued);
-        _ = BroadcastStats(force: true);
-
-        bool semaphoreAcquired = false;
-        try
-        {
-            semaphoreAcquired = await semaphore.WaitAsync(TimeSpan.FromSeconds(60), ct);
-            if (!semaphoreAcquired)
-            {
-                logger.LogWarning("翻译队列超时: 等待超过 60 秒，当前排队 {Queued}", Interlocked.Read(ref _queued));
-                throw new InvalidOperationException("翻译队列已满，请稍后重试");
-            }
-        }
-        catch
-        {
-            Interlocked.Decrement(ref _queued);
-            _ = BroadcastStats(force: true);
-            throw;
-        }
-
-        // Acquired: transition from queued to translating
-        Interlocked.Decrement(ref _queued);
-        Interlocked.Increment(ref _translating);
-        _ = BroadcastStats(force: true);
-
-        const int maxRetries = 2;
-        var chosenEndpoint = SelectEndpoint(endpoints);
-        var baseUrl = chosenEndpoint.Provider == LlmProvider.Custom
-            ? chosenEndpoint.ApiBaseUrl : GetDefaultBaseUrl(chosenEndpoint);
-
-        try
-        {
-            // Build system prompt once for the entire batch
-            var systemPrompt = BuildSystemPrompt(ai.SystemPrompt, from, to, glossary, gameDescription, memoryContext, dntHint);
-
-            var results = new List<TranslationCandidate>(texts.Count);
-            long totalTokens = 0;
-            double totalMs = 0;
-
-            for (int i = 0; i < texts.Count; i++)
-            {
-                var userContent = JsonSerializer.Serialize(new[] { texts[i] });
-                TranslationCandidate? translatedText = null;
-
-                for (int attempt = 0; attempt <= maxRetries; attempt++)
-                {
-                    try
-                    {
-                        var sw = Stopwatch.StartNew();
-                        var maxTokens = Math.Max(256, userContent.Length);
-                        var (content, tokens) = await CallOpenAiCompatRawAsync(
-                            chosenEndpoint, systemPrompt, userContent, ai.Temperature, baseUrl, ct,
-                            ai.LocalMinP, ai.LocalRepeatPenalty, maxTokens);
-                        sw.Stop();
-
-                        var elapsedMs = sw.Elapsed.TotalMilliseconds;
-                        var parsed = TranslationResponseParser.Parse(
-                            content,
-                            1,
-                            [fallbackTexts?[i] ?? texts[i]],
-                            logger);
-                        translatedText = parsed[0];
-
-                        // Update stats
-                        var stats = _endpointStats.GetOrAdd(chosenEndpoint.Id, _ => new EndpointStats());
-                        stats.RecordSuccess(elapsedMs);
-                        Interlocked.Add(ref _totalTokensUsed, tokens);
-                        Interlocked.Add(ref _totalResponseTimeMs, (long)elapsedMs);
-                        Interlocked.Increment(ref _totalRequests);
-                        _requestTimestamps.Enqueue(DateTime.UtcNow.Ticks);
-
-                        totalTokens += tokens;
-                        totalMs += elapsedMs;
-                        break;
-                    }
-                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex) when (attempt < maxRetries && IsTransientError(ex))
-                    {
-                        var stats = _endpointStats.GetOrAdd(chosenEndpoint.Id, _ => new EndpointStats());
-                        stats.RecordError();
-                        var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt) * 2);
-                        logger.LogWarning(ex, "本地模型翻译失败 (尝试 {Attempt}/{Max}), {Delay}s 后重试",
-                            attempt + 1, maxRetries + 1, delay.TotalSeconds);
-                        await Task.Delay(delay, ct);
-                    }
-                    catch (Exception ex)
-                    {
-                        var stats = _endpointStats.GetOrAdd(chosenEndpoint.Id, _ => new EndpointStats());
-                        stats.RecordError();
-                        logger.LogWarning(ex, "本地模型翻译第 {Index} 条文本失败，回退到原文", i);
-                        break; // Fall through to use original text
-                    }
-                }
-
-                results.Add(translatedText
-                    ?? new TranslationCandidate(fallbackTexts?[i] ?? texts[i], TranslationCandidateKind.FallbackOriginal));
-                _ = BroadcastStats(force: false); // Throttled (200ms)
-            }
-
-            return (results, totalTokens, totalMs, chosenEndpoint.Name);
-        }
-        finally
-        {
-            if (semaphoreAcquired)
-            {
-                Interlocked.Decrement(ref _translating);
-                semaphore.Release();
-                _ = BroadcastStats(force: true);
-            }
-        }
-    }
-
     // ── Load Balancer ──
 
     private ApiEndpointConfig SelectEndpoint(List<ApiEndpointConfig> endpoints)
@@ -1461,7 +1321,7 @@ public sealed class LlmTranslationService(
 
     // ── Provider dispatch ──
 
-    private async Task<(IList<TranslationCandidate> translations, long tokens)> CallProviderAsync(
+    private async Task<(IList<TranslationCandidate> translations, long tokens, bool? thinkingActive)> CallProviderAsync(
         ApiEndpointConfig endpoint, AiTranslationSettings ai,
         IList<string> texts, string from, string to,
         List<TermEntry>? glossary, string? gameDescription,
@@ -1532,9 +1392,15 @@ public sealed class LlmTranslationService(
             LlmProvider.OpenAI or LlmProvider.DeepSeek or LlmProvider.Qwen
                 or LlmProvider.GLM or LlmProvider.Kimi
                 => await CallOpenAiCompatRawAsync(endpoint, systemPrompt, userContent,
-                    temperature, GetDefaultBaseUrl(endpoint), ct),
+                    temperature, GetDefaultBaseUrl(endpoint), ct) switch
+                {
+                    var (content, tokens, _) => (content, tokens)
+                },
             LlmProvider.Custom => await CallOpenAiCompatRawAsync(endpoint, systemPrompt, userContent,
-                temperature, endpoint.ApiBaseUrl, ct),
+                temperature, endpoint.ApiBaseUrl, ct) switch
+            {
+                var (content, tokens, _) => (content, tokens)
+            },
             LlmProvider.Claude => await CallClaudeRawAsync(endpoint, systemPrompt, userContent, temperature, ct),
             LlmProvider.Gemini => await CallGeminiRawAsync(endpoint, systemPrompt, userContent, temperature, ct),
             _ => throw new NotSupportedException($"未支持的 LLM 提供商: {endpoint.Provider}")
@@ -1543,7 +1409,7 @@ public sealed class LlmTranslationService(
 
     // ── OpenAI-compatible (OpenAI, DeepSeek, Qwen, GLM, Kimi, Custom) ──
 
-    private async Task<(string content, long tokens)> CallOpenAiCompatRawAsync(
+    private async Task<(string content, long tokens, bool thinkingActive)> CallOpenAiCompatRawAsync(
         ApiEndpointConfig ep, string systemPrompt, string userContent,
         double temperature, string baseUrl, CancellationToken ct,
         double? minP = null, double? repeatPenalty = null, int? maxTokens = null)
@@ -1560,16 +1426,37 @@ public sealed class LlmTranslationService(
             new { role = "user", content = userContent }
         };
 
-        // Build request body — include sampling parameters for local endpoints
-        object body = minP.HasValue || repeatPenalty.HasValue || maxTokens.HasValue
-            ? new
-            {
-                model, temperature, messages,
-                min_p = minP ?? 0.05,
-                repeat_penalty = repeatPenalty ?? 1.0,
-                max_tokens = maxTokens ?? 4096
-            }
-            : new { model, temperature, messages } as object;
+        // Build request body — include sampling parameters for local endpoints.
+        // For DeepSeek, inject the thinking-mode switch when the endpoint explicitly opts in/out
+        // (null = omit the parameter and follow the model default).
+        var hasSampling = minP.HasValue || repeatPenalty.HasValue || maxTokens.HasValue;
+        object body;
+        if (ep.Provider == LlmProvider.DeepSeek && ep.ThinkingMode.HasValue)
+        {
+            var thinking = new { type = ep.ThinkingMode.Value ? "enabled" : "disabled" };
+            body = hasSampling
+                ? new
+                {
+                    model, temperature, messages,
+                    min_p = minP ?? 0.05,
+                    repeat_penalty = repeatPenalty ?? 1.0,
+                    max_tokens = maxTokens ?? 4096,
+                    thinking
+                } as object
+                : new { model, temperature, messages, thinking } as object;
+        }
+        else
+        {
+            body = hasSampling
+                ? new
+                {
+                    model, temperature, messages,
+                    min_p = minP ?? 0.05,
+                    repeat_penalty = repeatPenalty ?? 1.0,
+                    max_tokens = maxTokens ?? 4096
+                } as object
+                : new { model, temperature, messages } as object;
+        }
 
         var client = httpClientFactory.CreateClient("LLM");
         using var req = new HttpRequestMessage(HttpMethod.Post, endpoint)
@@ -1591,11 +1478,16 @@ public sealed class LlmTranslationService(
         var content = node?["choices"]?[0]?["message"]?["content"]?.GetValue<string>()
             ?? throw new InvalidOperationException("LLM 响应格式无效");
 
+        // DeepSeek thinking mode returns the chain-of-thought in `reasoning_content`
+        // (null/absent when thinking is off). Used to report the effective thinking state.
+        var reasoning = node?["choices"]?[0]?["message"]?["reasoning_content"]?.GetValue<string>();
+        var thinkingActive = !string.IsNullOrWhiteSpace(reasoning);
+
         var tokens = ExtractOpenAiTokens(node);
-        return (content, tokens);
+        return (content, tokens, thinkingActive);
     }
 
-    private async Task<(IList<TranslationCandidate>, long)> CallOpenAiCompatAsync(
+    private async Task<(IList<TranslationCandidate>, long tokens, bool? thinkingActive)> CallOpenAiCompatAsync(
         ApiEndpointConfig ep, AiTranslationSettings ai,
         IList<string> texts, string from, string to,
         List<TermEntry>? glossary, string? gameDescription,
@@ -1611,12 +1503,14 @@ public sealed class LlmTranslationService(
         var isLocal = ep.ApiKey == "local";
         var maxTokens = isLocal ? Math.Max(256, userContent.Length) : (int?)null;
 
-        var (content, tokens) = await CallOpenAiCompatRawAsync(
+        var (content, tokens, thinkingActive) = await CallOpenAiCompatRawAsync(
             ep, systemPrompt, userContent, ai.Temperature, baseUrl, ct,
             isLocal ? ai.LocalMinP : null,
             isLocal ? ai.LocalRepeatPenalty : null,
             maxTokens);
-        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens);
+        // Thinking state is only meaningful for DeepSeek; other OpenAI-compatible providers have no such concept.
+        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens,
+            ep.Provider == LlmProvider.DeepSeek ? thinkingActive : (bool?)null);
     }
 
     // ── Claude ──
@@ -1664,7 +1558,7 @@ public sealed class LlmTranslationService(
         return (content, inputTokens + outputTokens);
     }
 
-    private async Task<(IList<TranslationCandidate>, long)> CallClaudeAsync(
+    private async Task<(IList<TranslationCandidate>, long, bool?)> CallClaudeAsync(
         ApiEndpointConfig ep, AiTranslationSettings ai,
         IList<string> texts, string from, string to,
         List<TermEntry>? glossary, string? gameDescription,
@@ -1676,7 +1570,7 @@ public sealed class LlmTranslationService(
             ?? BuildSystemPrompt(ai.SystemPrompt, from, to, glossary, gameDescription, memoryContext, dntHint);
         var userContent = JsonSerializer.Serialize(texts);
         var (content, tokens) = await CallClaudeRawAsync(ep, systemPrompt, userContent, ai.Temperature, ct);
-        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens);
+        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens, null);
     }
 
     // ── Gemini ──
@@ -1723,7 +1617,7 @@ public sealed class LlmTranslationService(
         return (content, promptTokens + candidateTokens);
     }
 
-    private async Task<(IList<TranslationCandidate>, long)> CallGeminiAsync(
+    private async Task<(IList<TranslationCandidate>, long, bool?)> CallGeminiAsync(
         ApiEndpointConfig ep, AiTranslationSettings ai,
         IList<string> texts, string from, string to,
         List<TermEntry>? glossary, string? gameDescription,
@@ -1735,7 +1629,7 @@ public sealed class LlmTranslationService(
             ?? BuildSystemPrompt(ai.SystemPrompt, from, to, glossary, gameDescription, memoryContext, dntHint);
         var userContent = JsonSerializer.Serialize(texts);
         var (content, tokens) = await CallGeminiRawAsync(ep, systemPrompt, userContent, ai.Temperature, ct);
-        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens);
+        return (TranslationResponseParser.Parse(content, texts.Count, fallbackTexts, logger), tokens, null);
     }
 
     // ── Do-not-translate placeholder substitution ──
@@ -2334,7 +2228,7 @@ public sealed class LlmTranslationService(
             try
             {
                 var sw = Stopwatch.StartNew();
-                var (translations, _) = await CallProviderAsync(
+                var (translations, _, thinkingActive) = await CallProviderAsync(
                     ep, ai, testTexts, "en", "zh", null, null, null, null, ct, testTexts);
                 sw.Stop();
                 return new EndpointTestResult(
@@ -2343,7 +2237,8 @@ public sealed class LlmTranslationService(
                     true,
                     translations.Select(t => t.Text).ToList(),
                     null,
-                    Math.Round(sw.Elapsed.TotalMilliseconds, 1));
+                    Math.Round(sw.Elapsed.TotalMilliseconds, 1),
+                    thinkingActive);
             }
             catch (OperationCanceledException)
             {

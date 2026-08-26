@@ -6,10 +6,16 @@ public sealed class AiTranslationSettings
 {
     public bool Enabled { get; set; } = true;
 
-    /// <summary>"cloud" or "local". When "local", concurrency=1, no glossary extraction, contextSize capped at 10.</summary>
+    /// <summary>"cloud" or "local". Local mode uses LocalConcurrency, no glossary extraction, contextSize capped at 10.</summary>
     public string ActiveMode { get; set; } = "cloud";
 
     public int MaxConcurrency { get; set; } = 4;
+
+    /// <summary>
+    /// Max concurrency for local mode (1-100). Local llama-server pre-allocates
+    /// -np slots at startup, so changing this requires restarting the local model.
+    /// </summary>
+    public int LocalConcurrency { get; set; } = 4;
 
     public int Port { get; set; } = 51821;
 
@@ -85,4 +91,9 @@ public sealed class ApiEndpointConfig
     public string ModelName { get; set; } = "";
     public int Priority { get; set; } = 5;
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// 思考模式开关（仅 DeepSeek 系列模型生效）。null=不传参、跟随模型默认；true=强制开启；false=强制关闭。
+    /// </summary>
+    public bool? ThinkingMode { get; set; }
 }

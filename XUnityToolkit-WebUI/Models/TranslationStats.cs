@@ -75,7 +75,8 @@ public sealed record EndpointTestResult(
     bool Success,
     IList<string>? Translations,
     string? Error,
-    double ResponseTimeMs
+    double ResponseTimeMs,
+    bool? ThinkingActive = null
 );
 
 public sealed record GlossaryExtractionStats(
